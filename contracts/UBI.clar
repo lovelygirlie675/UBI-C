@@ -22,6 +22,10 @@
   (define-constant ERR_INVALID_CREDENTIALS (err u105))
   (define-constant ERR_CYCLE_NOT_COMPLETE (err u106))
   (define-constant ERR_INSUFFICIENT_FUNDS (err u107))
+  (define-constant ERR_INVALID_PROPOSAL (err u108))
+  (define-constant ERR_ALREADY_VOTED (err u109))
+  (define-constant ERR_LOCKED (err u110))
+  (define-constant ERR_NO_WITHDRAWAL (err u111))
 
 
   ;; Contract administrator
@@ -222,5 +226,135 @@
                             { claimed: false, amount: u0, stacks-block-height: u0 } 
                             (map-get? claims { user: user, cycle: (var-get current-cycle) })))))
       (+ last-claim CYCLE_LENGTH)))
+
+
+;; Add to data vars section
+(define-data-var contract-paused bool false)
+(define-data-var proposal-count uint u0)
+
+;; Add these public functions
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)))
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)))
+
+
+;; Add to constants
+(define-constant REFERRAL_BONUS u100)
+
+;; Add to data maps
+(define-map referrals
+  { referrer: principal }
+  { count: uint, total-bonus: uint })
+
+;; Add this public function
+(define-public (register-with-referral (name (string-ascii 64)) (email-hash (buff 32)) (referrer principal))
+  (let ((referrer-data (default-to { count: u0, total-bonus: u0 } (map-get? referrals { referrer: referrer }))))
+    (try! (register-user name email-hash))
+    (map-set referrals 
+      { referrer: referrer }
+      { count: (+ (get count referrer-data) u1),
+        total-bonus: (+ (get total-bonus referrer-data) REFERRAL_BONUS) })
+    (ok true)))
+
+
+
+;; Add to constants
+(define-constant TIER1_THRESHOLD u10)
+(define-constant TIER2_THRESHOLD u50)
+(define-constant TIER1_BONUS u100)
+(define-constant TIER2_BONUS u200)
+
+;; Add this read-only function
+(define-read-only (calculate-tier-bonus (claim-count uint))
+  (if (>= claim-count TIER2_THRESHOLD)
+      TIER2_BONUS
+      (if (>= claim-count TIER1_THRESHOLD)
+          TIER1_BONUS
+          u0)))
+
+
+;; Add to data maps
+(define-map proposals
+  { id: uint }
+  { title: (string-ascii 64),
+    votes: uint,
+    active: bool })
+
+(define-map user-votes
+  { user: principal, proposal-id: uint }
+  { voted: bool })
+
+;; Add these public functions
+(define-public (create-proposal (title (string-ascii 64)))
+  (let ((proposal-id (var-get proposal-count)))
+    (asserts! (is-registered tx-sender) ERR_NOT_REGISTERED)
+    (map-set proposals
+      { id: proposal-id }
+      { title: title, votes: u0, active: true })
+    (var-set proposal-count (+ proposal-id u1))
+    (ok proposal-id)))
+
+(define-public (vote-on-proposal (proposal-id uint))
+  (let ((proposal (default-to { title: "", votes: u0, active: false }
+                             (map-get? proposals { id: proposal-id }))))
+    (asserts! (get active proposal) ERR_INVALID_PROPOSAL)
+    (asserts! (not (default-to false (get voted (map-get? user-votes { user: tx-sender, proposal-id: proposal-id })))) ERR_ALREADY_VOTED)
+    (map-set proposals
+      { id: proposal-id }
+      { title: (get title proposal),
+        votes: (+ (get votes proposal) u1),
+        active: true })
+    (ok true)))
+
+
+;; Add to data maps
+(define-map withdrawal-requests
+  { user: principal }
+  { amount: uint,
+    unlock-height: uint })
+
+;; Add these public functions
+(define-public (request-withdrawal (amount uint))
+  (let ((lock-period u144)) ;; 24 hours in blocks
+    (map-set withdrawal-requests
+      { user: tx-sender }
+      { amount: amount,
+        unlock-height: (+ stacks-block-height lock-period) })
+    (ok true)))
+
+(define-public (execute-withdrawal)
+  (let ((request (default-to { amount: u0, unlock-height: u0 }
+                            (map-get? withdrawal-requests { user: tx-sender }))))
+    (asserts! (>= stacks-block-height (get unlock-height request)) ERR_LOCKED)
+    (asserts! (> (get amount request) u0) ERR_NO_WITHDRAWAL)
+    (ok (get amount request))))
+
+
+;; Add to data maps
+(define-map user-achievements
+  { user: principal }
+  { consecutive-claims: uint,
+    total-claimed: uint,
+    special-status: bool })
+
+;; Add this public function
+(define-public (update-achievements)
+  (let ((user-data (default-to 
+                     { consecutive-claims: u0, total-claimed: u0, special-status: false }
+                     (map-get? user-achievements { user: tx-sender }))))
+    (map-set user-achievements
+      { user: tx-sender }
+      { consecutive-claims: (+ (get consecutive-claims user-data) u1),
+        total-claimed: (+ (get total-claimed user-data) UBI_AMOUNT),
+        special-status: (>= (+ (get consecutive-claims user-data) u1) u12) })
+    (ok true)))
 
 
