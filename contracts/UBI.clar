@@ -358,3 +358,56 @@
     (ok true)))
 
 
+(define-map delegates 
+  { user: principal }
+  { delegate: principal, active: bool })
+
+(define-public (set-delegate (delegate-address principal))
+  (begin
+    (asserts! (default-to false (map-get? registered-users tx-sender)) ERR_NOT_REGISTERED)
+    (map-set delegates
+      { user: tx-sender }
+      { delegate: delegate-address, active: true })
+    (ok true)))
+
+(define-public (remove-delegate)
+  (begin
+    (asserts! (default-to false (map-get? registered-users tx-sender)) ERR_NOT_REGISTERED)
+    (map-set delegates
+      { user: tx-sender }
+      { delegate: tx-sender, active: false })
+    (ok true)))
+
+(define-public (claim-ubi-delegated (user principal))
+  (let ((delegate-info (default-to 
+                        { delegate: tx-sender, active: false }
+                        (map-get? delegates { user: user }))))
+    (asserts! (is-eq (get delegate delegate-info) tx-sender) ERR_NOT_AUTHORIZED)
+    (asserts! (get active delegate-info) ERR_NOT_AUTHORIZED)
+    (try! (claim-ubi))
+    (ok true)))
+
+
+(define-data-var pause-until uint u0)
+(define-constant MAX_PAUSE_DURATION u1008)
+
+(define-public (emergency-pause (duration uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (<= duration MAX_PAUSE_DURATION) ERR_INVALID_PROPOSAL)
+    (var-set contract-paused true)
+    (var-set pause-until (+ stacks-block-height duration))
+    (ok true)))
+
+(define-read-only (is-contract-paused)
+  (if (>= stacks-block-height (var-get pause-until))
+      false
+      (var-get contract-paused)))
+
+(define-public (force-unpause)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= stacks-block-height (var-get pause-until)) ERR_LOCKED)
+    (var-set contract-paused false)
+    (var-set pause-until u0)
+    (ok true)))
