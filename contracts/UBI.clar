@@ -411,3 +411,134 @@
     (var-set contract-paused false)
     (var-set pause-until u0)
     (ok true)))
+
+(define-constant MIN_SIGNERS u2)
+(define-constant MAX_SIGNERS u5)
+(define-constant LARGE_WITHDRAWAL_THRESHOLD u10000)
+(define-constant ERR_INSUFFICIENT_SIGNERS (err u112))
+(define-constant ERR_INVALID_SIGNER (err u113))
+(define-constant ERR_TRANSACTION_NOT_FOUND (err u114))
+(define-constant ERR_ALREADY_SIGNED (err u115))
+
+(define-data-var multisig-enabled bool false)
+(define-data-var required-signatures uint u2)
+(define-data-var transaction-nonce uint u0)
+
+(define-map authorized-signers principal bool)
+
+(define-map pending-transactions
+  { tx-id: uint }
+  { action: (string-ascii 32),
+    amount: uint,
+    target: principal,
+    signatures: uint,
+    executed: bool,
+    created-at: uint })
+
+(define-map transaction-signatures
+  { tx-id: uint, signer: principal }
+  { signed: bool, timestamp: uint })
+
+;; Add to data maps
+(define-map user-activity
+  { user: principal }
+  { last-activity: uint,
+    activity-count: uint }) 
+
+
+(define-public (enable-multisig (signers (list 5 principal)) (required uint))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (and (>= required MIN_SIGNERS) (<= required MAX_SIGNERS)) ERR_INSUFFICIENT_SIGNERS)
+    (asserts! (>= (len signers) required) ERR_INSUFFICIENT_SIGNERS)
+    
+    (map add-signer signers)
+    (var-set required-signatures required)
+    (var-set multisig-enabled true)
+    (ok true)))
+
+(define-public (propose-treasury-withdrawal (amount uint) (recipient principal))
+  (let ((tx-id (var-get transaction-nonce)))
+    (asserts! (var-get multisig-enabled) ERR_NOT_AUTHORIZED)
+    (asserts! (default-to false (map-get? authorized-signers tx-sender)) ERR_INVALID_SIGNER)
+    (asserts! (>= amount LARGE_WITHDRAWAL_THRESHOLD) ERR_INVALID_PROPOSAL)
+    
+    (map-set pending-transactions
+      { tx-id: tx-id }
+      { action: "withdraw",
+        amount: amount,
+        target: recipient,
+        signatures: u1,
+        executed: false,
+        created-at: stacks-block-height })
+    
+    (map-set transaction-signatures
+      { tx-id: tx-id, signer: tx-sender }
+      { signed: true, timestamp: stacks-block-height })
+    
+    (var-set transaction-nonce (+ tx-id u1))
+    (ok tx-id)))
+
+(define-public (sign-transaction (tx-id uint))
+  (let ((tx-data (unwrap! (map-get? pending-transactions { tx-id: tx-id }) ERR_TRANSACTION_NOT_FOUND)))
+    (asserts! (default-to false (map-get? authorized-signers tx-sender)) ERR_INVALID_SIGNER)
+    (asserts! (not (get executed tx-data)) ERR_INVALID_PROPOSAL)
+    (asserts! (not (default-to false (get signed (map-get? transaction-signatures { tx-id: tx-id, signer: tx-sender })))) ERR_ALREADY_SIGNED)
+    
+    (map-set transaction-signatures
+      { tx-id: tx-id, signer: tx-sender }
+      { signed: true, timestamp: stacks-block-height })
+    
+    (map-set pending-transactions
+      { tx-id: tx-id }
+      { action: (get action tx-data),
+        amount: (get amount tx-data),
+        target: (get target tx-data),
+        signatures: (+ (get signatures tx-data) u1),
+        executed: false,
+        created-at: (get created-at tx-data) })
+    
+    (ok true)))
+
+(define-public (execute-transaction (tx-id uint))
+  (let ((tx-data (unwrap! (map-get? pending-transactions { tx-id: tx-id }) ERR_TRANSACTION_NOT_FOUND)))
+    (asserts! (default-to false (map-get? authorized-signers tx-sender)) ERR_INVALID_SIGNER)
+    (asserts! (not (get executed tx-data)) ERR_INVALID_PROPOSAL)
+    (asserts! (>= (get signatures tx-data) (var-get required-signatures)) ERR_INSUFFICIENT_SIGNERS)
+    (asserts! (>= (var-get treasury-balance) (get amount tx-data)) ERR_INSUFFICIENT_FUNDS)
+    
+    (var-set treasury-balance (- (var-get treasury-balance) (get amount tx-data)))
+    
+    (map-set pending-transactions
+      { tx-id: tx-id }
+      { action: (get action tx-data),
+        amount: (get amount tx-data),
+        target: (get target tx-data),
+        signatures: (get signatures tx-data),
+        executed: true,
+        created-at: (get created-at tx-data) })
+    
+    (ok (get amount tx-data))))
+
+(define-public (revoke-signer (signer principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (map-delete authorized-signers signer)
+    (ok true)))
+
+(define-private (add-signer (signer principal))
+  (map-set authorized-signers signer true))
+
+(define-read-only (is-authorized-signer (signer principal))
+  (default-to false (map-get? authorized-signers signer)))
+
+(define-read-only (get-transaction-details (tx-id uint))
+  (map-get? pending-transactions { tx-id: tx-id }))
+
+(define-read-only (has-signed-transaction (tx-id uint) (signer principal))
+  (default-to false (get signed (map-get? transaction-signatures { tx-id: tx-id, signer: signer }))))
+
+(define-read-only (get-multisig-status)
+  { enabled: (var-get multisig-enabled),
+    required-signatures: (var-get required-signatures),
+    current-nonce: (var-get transaction-nonce) })
