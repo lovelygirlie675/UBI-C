@@ -27,6 +27,35 @@
   (define-constant ERR_LOCKED (err u110))
   (define-constant ERR_NO_WITHDRAWAL (err u111))
 
+  
+;; UBI Savings Account Constants
+(define-constant DEFAULT_SAVINGS_RATE u20)
+(define-constant MAX_SAVINGS_RATE u50)
+(define-constant SAVINGS_INTEREST_RATE u5)
+(define-constant MIN_SAVINGS_WITHDRAWAL u50)
+(define-constant ERR_SAVINGS_INSUFFICIENT (err u116))
+(define-constant ERR_INVALID_SAVINGS_RATE (err u117))
+(define-constant ERR_SAVINGS_LOCKED (err u118))
+
+;; Savings Data Maps
+(define-map user-savings-accounts
+  { user: principal }
+  { balance: uint,
+    savings-rate: uint,
+    total-deposited: uint,
+    last-interest-block: uint,
+    lock-until: uint })
+
+(define-map savings-transactions
+  { user: principal, transaction-id: uint }
+  { amount: uint,
+    transaction-type: (string-ascii 10),
+    block-height: uint })
+
+;; Savings Data Variables
+(define-data-var total-savings-pool uint u0)
+(define-data-var next-transaction-id uint u0)
+
 
   ;; Contract administrator
   (define-data-var contract-owner principal tx-sender)
@@ -542,3 +571,178 @@
   { enabled: (var-get multisig-enabled),
     required-signatures: (var-get required-signatures),
     current-nonce: (var-get transaction-nonce) })
+
+
+
+;; Set User Savings Rate
+(define-public (set-savings-rate (rate uint))
+  (begin
+    (asserts! (default-to false (map-get? registered-users tx-sender)) ERR_NOT_REGISTERED)
+    (asserts! (<= rate MAX_SAVINGS_RATE) ERR_INVALID_SAVINGS_RATE)
+    
+    (let ((current-account (default-to 
+                           { balance: u0, savings-rate: DEFAULT_SAVINGS_RATE, 
+                             total-deposited: u0, last-interest-block: stacks-block-height, 
+                             lock-until: u0 }
+                           (map-get? user-savings-accounts { user: tx-sender }))))
+      (map-set user-savings-accounts
+        { user: tx-sender }
+        { balance: (get balance current-account),
+          savings-rate: rate,
+          total-deposited: (get total-deposited current-account),
+          last-interest-block: (get last-interest-block current-account),
+          lock-until: (get lock-until current-account) }))
+    
+    (ok rate)))
+
+;; Enhanced Claim UBI with Automatic Savings
+(define-public (claim-ubi-with-savings)
+  (let ((current-cycle-num (var-get current-cycle))
+        (treasury (var-get treasury-balance))
+        (user-verified (get verified (default-to 
+                                     { verified: false, registration-block: u0 } 
+                                     (map-get? user-verification { user: tx-sender }))))
+        (savings-account (default-to 
+                         { balance: u0, savings-rate: DEFAULT_SAVINGS_RATE, 
+                           total-deposited: u0, last-interest-block: stacks-block-height, 
+                           lock-until: u0 }
+                         (map-get? user-savings-accounts { user: tx-sender }))))
+    
+    (asserts! (default-to false (map-get? registered-users tx-sender)) ERR_NOT_REGISTERED)
+    (asserts! user-verified ERR_INVALID_CREDENTIALS)
+    (asserts! (not (default-to false 
+                               (get claimed (map-get? claims { user: tx-sender, cycle: current-cycle-num })))) 
+              ERR_ALREADY_CLAIMED)
+    (asserts! (>= treasury UBI_AMOUNT) ERR_INSUFFICIENT_FUNDS)
+    
+    (let ((savings-amount (/ (* UBI_AMOUNT (get savings-rate savings-account)) u100))
+          (payout-amount (- UBI_AMOUNT savings-amount))
+          (tx-id (var-get next-transaction-id)))
+      
+      (map-set claims 
+        { user: tx-sender, cycle: current-cycle-num } 
+        { claimed: true, amount: UBI_AMOUNT, stacks-block-height: stacks-block-height })
+      
+      (map-set user-savings-accounts
+        { user: tx-sender }
+        { balance: (+ (get balance savings-account) savings-amount),
+          savings-rate: (get savings-rate savings-account),
+          total-deposited: (+ (get total-deposited savings-account) savings-amount),
+          last-interest-block: stacks-block-height,
+          lock-until: (get lock-until savings-account) })
+      
+      (map-set savings-transactions
+        { user: tx-sender, transaction-id: tx-id }
+        { amount: savings-amount,
+          transaction-type: "deposit",
+          block-height: stacks-block-height })
+      
+      (var-set treasury-balance (- treasury UBI_AMOUNT))
+      (var-set total-savings-pool (+ (var-get total-savings-pool) savings-amount))
+      (var-set next-transaction-id (+ tx-id u1))
+      
+      (ok { payout: payout-amount, saved: savings-amount }))))
+
+;; Withdraw from Savings Account
+(define-public (withdraw-savings (amount uint))
+  (let ((savings-account (unwrap! (map-get? user-savings-accounts { user: tx-sender }) ERR_NOT_REGISTERED))
+        (tx-id (var-get next-transaction-id)))
+    
+    (asserts! (>= (get balance savings-account) amount) ERR_SAVINGS_INSUFFICIENT)
+    (asserts! (>= amount MIN_SAVINGS_WITHDRAWAL) ERR_INVALID_PROPOSAL)
+    (asserts! (>= stacks-block-height (get lock-until savings-account)) ERR_SAVINGS_LOCKED)
+    
+    (map-set user-savings-accounts
+      { user: tx-sender }
+      { balance: (- (get balance savings-account) amount),
+        savings-rate: (get savings-rate savings-account),
+        total-deposited: (get total-deposited savings-account),
+        last-interest-block: (get last-interest-block savings-account),
+        lock-until: (get lock-until savings-account) })
+    
+    (map-set savings-transactions
+      { user: tx-sender, transaction-id: tx-id }
+      { amount: amount,
+        transaction-type: "withdraw",
+        block-height: stacks-block-height })
+    
+    (var-set total-savings-pool (- (var-get total-savings-pool) amount))
+    (var-set next-transaction-id (+ tx-id u1))
+    
+    (ok amount)))
+
+;; Calculate and Apply Interest to Savings
+(define-public (apply-savings-interest)
+  (let ((savings-account (unwrap! (map-get? user-savings-accounts { user: tx-sender }) ERR_NOT_REGISTERED))
+        (blocks-since-last-interest (- stacks-block-height (get last-interest-block savings-account)))
+        (interest-cycles (/ blocks-since-last-interest CYCLE_LENGTH)))
+    
+    (asserts! (> interest-cycles u0) ERR_CYCLE_NOT_COMPLETE)
+    
+    (let ((current-balance (get balance savings-account))
+          (interest-amount (/ (* current-balance SAVINGS_INTEREST_RATE interest-cycles) u100))
+          (tx-id (var-get next-transaction-id)))
+      
+      (map-set user-savings-accounts
+        { user: tx-sender }
+        { balance: (+ current-balance interest-amount),
+          savings-rate: (get savings-rate savings-account),
+          total-deposited: (get total-deposited savings-account),
+          last-interest-block: stacks-block-height,
+          lock-until: (get lock-until savings-account) })
+      
+      (map-set savings-transactions
+        { user: tx-sender, transaction-id: tx-id }
+        { amount: interest-amount,
+          transaction-type: "interest",
+          block-height: stacks-block-height })
+      
+      (var-set next-transaction-id (+ tx-id u1))
+      
+      (ok interest-amount))))
+
+;; Lock Savings for Higher Interest
+(define-public (lock-savings (lock-cycles uint))
+  (let ((savings-account (unwrap! (map-get? user-savings-accounts { user: tx-sender }) ERR_NOT_REGISTERED))
+        (lock-blocks (* lock-cycles CYCLE_LENGTH)))
+    
+    (asserts! (> (get balance savings-account) u0) ERR_SAVINGS_INSUFFICIENT)
+    (asserts! (and (>= lock-cycles u4) (<= lock-cycles u52)) ERR_INVALID_PROPOSAL)
+    
+    (map-set user-savings-accounts
+      { user: tx-sender }
+      { balance: (get balance savings-account),
+        savings-rate: (get savings-rate savings-account),
+        total-deposited: (get total-deposited savings-account),
+        last-interest-block: (get last-interest-block savings-account),
+        lock-until: (+ stacks-block-height lock-blocks) })
+    
+    (ok lock-blocks)))
+
+;; Read-Only Functions for Savings
+
+(define-read-only (get-savings-account (user principal))
+  (default-to 
+    { balance: u0, savings-rate: DEFAULT_SAVINGS_RATE, 
+      total-deposited: u0, last-interest-block: u0, 
+      lock-until: u0 }
+    (map-get? user-savings-accounts { user: user })))
+
+(define-read-only (get-savings-transaction (user principal) (transaction-id uint))
+  (map-get? savings-transactions { user: user, transaction-id: transaction-id }))
+
+(define-read-only (calculate-pending-interest (user principal))
+  (let ((savings-account (get-savings-account user))
+        (blocks-since-last-interest (- stacks-block-height (get last-interest-block savings-account)))
+        (interest-cycles (/ blocks-since-last-interest CYCLE_LENGTH)))
+    
+    (if (> interest-cycles u0)
+        (/ (* (get balance savings-account) SAVINGS_INTEREST_RATE interest-cycles) u100)
+        u0)))
+
+(define-read-only (get-total-savings-pool)
+  (var-get total-savings-pool))
+
+(define-read-only (is-savings-locked (user principal))
+  (let ((savings-account (get-savings-account user)))
+    (>= (get lock-until savings-account) stacks-block-height)))
