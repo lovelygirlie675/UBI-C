@@ -746,3 +746,272 @@
 (define-read-only (is-savings-locked (user principal))
   (let ((savings-account (get-savings-account user)))
     (>= (get lock-until savings-account) stacks-block-height)))
+
+;; =================
+;; UBI INSURANCE POOL
+;; =================
+
+;; Insurance Pool Constants
+(define-constant INSURANCE_CONTRIBUTION_RATE u5) ;; 5% of UBI amount per cycle
+(define-constant MIN_INSURANCE_CLAIM u500) ;; Minimum emergency claim amount
+(define-constant MAX_INSURANCE_CLAIM u5000) ;; Maximum emergency claim amount
+(define-constant INSURANCE_ELIGIBILITY_CYCLES u6) ;; Must contribute for 6 cycles before claiming
+(define-constant CLAIM_VOTING_PERIOD u1008) ;; 1 week voting period for claims
+(define-constant REQUIRED_CLAIM_VOTES u3) ;; Minimum votes needed to approve claim
+(define-constant MAX_CLAIMS_PER_YEAR u2) ;; Maximum claims per user per year
+
+;; Insurance Error Codes
+(define-constant ERR_INSURANCE_INSUFFICIENT (err u119))
+(define-constant ERR_CLAIM_LIMIT_EXCEEDED (err u120))
+(define-constant ERR_INSURANCE_INELIGIBLE (err u121))
+(define-constant ERR_CLAIM_VOTING_ACTIVE (err u122))
+(define-constant ERR_CLAIM_EXPIRED (err u123))
+(define-constant ERR_DUPLICATE_VOTE (err u124))
+
+;; Insurance Data Variables
+(define-data-var insurance-pool-balance uint u0)
+(define-data-var total-insurance-claims uint u0)
+(define-data-var claim-request-counter uint u0)
+
+;; Insurance Data Maps
+(define-map insurance-contributors
+  { user: principal }
+  { total-contributed: uint,
+    cycles-contributed: uint,
+    last-contribution-cycle: uint,
+    eligible-since: uint })
+
+(define-map insurance-claims
+  { claim-id: uint }
+  { claimant: principal,
+    amount: uint,
+    reason: (string-ascii 128),
+    status: (string-ascii 16),
+    votes-for: uint,
+    votes-against: uint,
+    created-at: uint,
+    voting-ends: uint })
+
+(define-map claim-votes
+  { claim-id: uint, voter: principal }
+  { vote: bool, ;; true = approve, false = deny
+    timestamp: uint })
+
+(define-map annual-claim-counts
+  { user: principal, year: uint }
+  { claims-made: uint })
+
+(define-map insurance-payouts
+  { user: principal, claim-id: uint }
+  { amount: uint,
+    payout-date: uint,
+    reason: (string-ascii 128) })
+
+;; Contribute to Insurance Pool (automatic with UBI claim)
+(define-public (contribute-to-insurance)
+  (let ((current-cycle-num (var-get current-cycle))
+        (contribution-amount (/ (* UBI_AMOUNT INSURANCE_CONTRIBUTION_RATE) u100))
+        (contributor-data (default-to 
+                          { total-contributed: u0, cycles-contributed: u0, 
+                            last-contribution-cycle: u0, eligible-since: u0 }
+                          (map-get? insurance-contributors { user: tx-sender }))))
+    
+    ;; Verify user is registered and hasn't contributed this cycle
+    (asserts! (default-to false (map-get? registered-users tx-sender)) ERR_NOT_REGISTERED)
+    (asserts! (not (is-eq (get last-contribution-cycle contributor-data) current-cycle-num)) ERR_ALREADY_CLAIMED)
+    
+    ;; Update contributor record
+    (let ((new-cycles (+ (get cycles-contributed contributor-data) u1)))
+      (map-set insurance-contributors
+        { user: tx-sender }
+        { total-contributed: (+ (get total-contributed contributor-data) contribution-amount),
+          cycles-contributed: new-cycles,
+          last-contribution-cycle: current-cycle-num,
+          eligible-since: (if (>= new-cycles INSURANCE_ELIGIBILITY_CYCLES)
+                             (if (is-eq (get eligible-since contributor-data) u0)
+                                stacks-block-height
+                                (get eligible-since contributor-data))
+                             u0) }))
+    
+    ;; Update insurance pool balance
+    (var-set insurance-pool-balance (+ (var-get insurance-pool-balance) contribution-amount))
+    
+    (ok contribution-amount)))
+
+;; Submit Insurance Claim Request
+(define-public (submit-insurance-claim (amount uint) (reason (string-ascii 128)))
+  (let ((claim-id (var-get claim-request-counter))
+        (current-year (/ stacks-block-height (* CYCLE_LENGTH u52))) ;; Approximate year calculation
+        (contributor-data (unwrap! (map-get? insurance-contributors { user: tx-sender }) ERR_INSURANCE_INELIGIBLE))
+        (annual-claims (default-to { claims-made: u0 } 
+                                  (map-get? annual-claim-counts { user: tx-sender, year: current-year }))))
+    
+    ;; Verify eligibility and limits
+    (asserts! (>= (get cycles-contributed contributor-data) INSURANCE_ELIGIBILITY_CYCLES) ERR_INSURANCE_INELIGIBLE)
+    (asserts! (and (>= amount MIN_INSURANCE_CLAIM) (<= amount MAX_INSURANCE_CLAIM)) ERR_INVALID_PROPOSAL)
+    (asserts! (< (get claims-made annual-claims) MAX_CLAIMS_PER_YEAR) ERR_CLAIM_LIMIT_EXCEEDED)
+    (asserts! (>= (var-get insurance-pool-balance) amount) ERR_INSURANCE_INSUFFICIENT)
+    
+    ;; Create claim request
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      { claimant: tx-sender,
+        amount: amount,
+        reason: reason,
+        status: "pending",
+        votes-for: u0,
+        votes-against: u0,
+        created-at: stacks-block-height,
+        voting-ends: (+ stacks-block-height CLAIM_VOTING_PERIOD) })
+    
+    ;; Update claim counter
+    (var-set claim-request-counter (+ claim-id u1))
+    
+    (ok claim-id)))
+
+;; Vote on Insurance Claim
+(define-public (vote-on-insurance-claim (claim-id uint) (approve bool))
+  (let ((claim-data (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR_TRANSACTION_NOT_FOUND))
+        (contributor-data (unwrap! (map-get? insurance-contributors { user: tx-sender }) ERR_INSURANCE_INELIGIBLE)))
+    
+    ;; Verify voting eligibility
+    (asserts! (>= (get cycles-contributed contributor-data) INSURANCE_ELIGIBILITY_CYCLES) ERR_INSURANCE_INELIGIBLE)
+    (asserts! (is-eq (get status claim-data) "pending") ERR_CLAIM_VOTING_ACTIVE)
+    (asserts! (< stacks-block-height (get voting-ends claim-data)) ERR_CLAIM_EXPIRED)
+    (asserts! (not (is-some (map-get? claim-votes { claim-id: claim-id, voter: tx-sender }))) ERR_DUPLICATE_VOTE)
+    (asserts! (not (is-eq (get claimant claim-data) tx-sender)) ERR_NOT_AUTHORIZED) ;; Can't vote on own claim
+    
+    ;; Record vote
+    (map-set claim-votes
+      { claim-id: claim-id, voter: tx-sender }
+      { vote: approve, timestamp: stacks-block-height })
+    
+    ;; Update claim vote counts
+    (map-set insurance-claims
+      { claim-id: claim-id }
+      { claimant: (get claimant claim-data),
+        amount: (get amount claim-data),
+        reason: (get reason claim-data),
+        status: (get status claim-data),
+        votes-for: (if approve (+ (get votes-for claim-data) u1) (get votes-for claim-data)),
+        votes-against: (if approve (get votes-against claim-data) (+ (get votes-against claim-data) u1)),
+        created-at: (get created-at claim-data),
+        voting-ends: (get voting-ends claim-data) })
+    
+    (ok approve)))
+
+;; Process Insurance Claim (after voting period)
+(define-public (process-insurance-claim (claim-id uint))
+  (let ((claim-data (unwrap! (map-get? insurance-claims { claim-id: claim-id }) ERR_TRANSACTION_NOT_FOUND))
+        (current-year (/ stacks-block-height (* CYCLE_LENGTH u52))))
+    
+    ;; Verify claim can be processed
+    (asserts! (is-eq (get status claim-data) "pending") ERR_CLAIM_VOTING_ACTIVE)
+    (asserts! (>= stacks-block-height (get voting-ends claim-data)) ERR_LOCKED)
+    
+    ;; Check if claim is approved
+    (if (and (>= (get votes-for claim-data) REQUIRED_CLAIM_VOTES)
+             (> (get votes-for claim-data) (get votes-against claim-data)))
+        ;; Claim approved - process payout
+        (begin
+          (asserts! (>= (var-get insurance-pool-balance) (get amount claim-data)) ERR_INSURANCE_INSUFFICIENT)
+          
+          ;; Update claim status
+          (map-set insurance-claims
+            { claim-id: claim-id }
+            { claimant: (get claimant claim-data),
+              amount: (get amount claim-data),
+              reason: (get reason claim-data),
+              status: "approved",
+              votes-for: (get votes-for claim-data),
+              votes-against: (get votes-against claim-data),
+              created-at: (get created-at claim-data),
+              voting-ends: (get voting-ends claim-data) })
+          
+          ;; Record payout
+          (map-set insurance-payouts
+            { user: (get claimant claim-data), claim-id: claim-id }
+            { amount: (get amount claim-data),
+              payout-date: stacks-block-height,
+              reason: (get reason claim-data) })
+          
+          ;; Update annual claim count
+          (let ((annual-claims (default-to { claims-made: u0 } 
+                                          (map-get? annual-claim-counts { user: (get claimant claim-data), year: current-year }))))
+            (map-set annual-claim-counts
+              { user: (get claimant claim-data), year: current-year }
+              { claims-made: (+ (get claims-made annual-claims) u1) }))
+          
+          ;; Update pool balance and counters
+          (var-set insurance-pool-balance (- (var-get insurance-pool-balance) (get amount claim-data)))
+          (var-set total-insurance-claims (+ (var-get total-insurance-claims) u1))
+          
+          (ok { status: "approved", amount: (get amount claim-data) }))
+        
+        ;; Claim denied
+        (begin
+          (map-set insurance-claims
+            { claim-id: claim-id }
+            { claimant: (get claimant claim-data),
+              amount: (get amount claim-data),
+              reason: (get reason claim-data),
+              status: "denied",
+              votes-for: (get votes-for claim-data),
+              votes-against: (get votes-against claim-data),
+              created-at: (get created-at claim-data),
+              voting-ends: (get voting-ends claim-data) })
+          
+          (ok { status: "denied", amount: u0 })))))
+
+;; Emergency Withdraw from Insurance Pool (admin only)
+(define-public (emergency-withdraw-insurance (amount uint) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (var-get insurance-pool-balance) amount) ERR_INSURANCE_INSUFFICIENT)
+    
+    (var-set insurance-pool-balance (- (var-get insurance-pool-balance) amount))
+    
+    (ok amount)))
+
+;; Read-Only Functions for Insurance Pool
+
+(define-read-only (get-insurance-contributor (user principal))
+  (default-to 
+    { total-contributed: u0, cycles-contributed: u0, 
+      last-contribution-cycle: u0, eligible-since: u0 }
+    (map-get? insurance-contributors { user: user })))
+
+(define-read-only (get-insurance-claim (claim-id uint))
+  (map-get? insurance-claims { claim-id: claim-id }))
+
+(define-read-only (get-claim-vote (claim-id uint) (voter principal))
+  (map-get? claim-votes { claim-id: claim-id, voter: voter }))
+
+(define-read-only (get-insurance-payout (user principal) (claim-id uint))
+  (map-get? insurance-payouts { user: user, claim-id: claim-id }))
+
+(define-read-only (get-annual-claims (user principal) (year uint))
+  (default-to { claims-made: u0 } 
+              (map-get? annual-claim-counts { user: user, year: year })))
+
+(define-read-only (get-insurance-pool-status)
+  { balance: (var-get insurance-pool-balance),
+    total-claims: (var-get total-insurance-claims),
+    pending-claims: (var-get claim-request-counter) })
+
+(define-read-only (is-insurance-eligible (user principal))
+  (let ((contributor-data (get-insurance-contributor user)))
+    (and (>= (get cycles-contributed contributor-data) INSURANCE_ELIGIBILITY_CYCLES)
+         (> (get eligible-since contributor-data) u0))))
+
+(define-read-only (calculate-insurance-contribution (ubi-amount uint))
+  (/ (* ubi-amount INSURANCE_CONTRIBUTION_RATE) u100))
+
+
+
+
+
+
+
+
+  
